@@ -1,11 +1,15 @@
+import { getConnectionType } from '../libraries/connectionInfo/connectionUtils.js';
+import { getDevicePixelRatio } from '../libraries/devicePixelRatio/devicePixelRatio.js';
 import { getDNT } from '../libraries/dnt/index.js';
+import { createMgidSessionStorage } from '../libraries/mgidUtils/mgidSessionStorage.js';
+import { createMgidUadCache } from '../libraries/mgidUtils/mgidUadCache.js';
 import { getUserSyncs } from '../libraries/mgidUtils/mgidUtils.js';
 import { ortbConverter } from '../libraries/ortbConverter/converter.js';
-import { getDevicePixelRatio } from '../libraries/devicePixelRatio/devicePixelRatio.js';
+import { parseUserAgentDetailed } from '../libraries/userAgentUtils/detailed.js';
 import { registerBidder } from '../src/adapters/bidderFactory.js';
+import { NATIVE_ASSET_TYPES, NATIVE_IMAGE_TYPES } from '../src/constants.js';
 import { BANNER, NATIVE } from '../src/mediaTypes.js';
 import { toOrtbNativeRequest } from '../src/native.js';
-import { NATIVE_ASSET_TYPES, NATIVE_IMAGE_TYPES } from '../src/constants.js';
 import { getStorageManager } from '../src/storageManager.js';
 import {
   deepAccess,
@@ -38,6 +42,8 @@ const GVLID = 358;
 const DEFAULT_CUR = 'USD';
 const BIDDER_CODE = 'mgid';
 export const storage = getStorageManager({ bidderCode: BIDDER_CODE });
+export const mgidSession = createMgidSessionStorage(storage);
+export const mgidUad = createMgidUadCache(storage);
 const ENDPOINT_URL = 'https://prebid.mgid.com/prebid/';
 const LOG_WARN_PREFIX = '[MGID warn]: ';
 const LOG_INFO_PREFIX = '[MGID info]: ';
@@ -45,6 +51,8 @@ const DEFAULT_IMAGE_WIDTH = 492;
 const DEFAULT_IMAGE_HEIGHT = 328;
 const DEFAULT_ICON_WIDTH = 50;
 const DEFAULT_ICON_HEIGHT = 50;
+
+const LS_KEY_MUID = 'mgMuidn';
 
 // Supported native asset keys for isBidRequestValid
 const SUPPORTED_NATIVE_KEYS = new Set([
@@ -144,7 +152,7 @@ const converter = ortbConverter({
   response(buildResponse, bidResponses, ortbResponse, context) {
     const muidn = deepAccess(ortbResponse, 'ext.muidn');
     if (isStr(muidn) && muidn.length > 0) {
-      setLocalStorageSafely('mgMuidn', muidn);
+      setLocalStorageSafely(LS_KEY_MUID, muidn);
     }
     return buildResponse(bidResponses, ortbResponse, context);
   },
@@ -216,7 +224,7 @@ export const spec = {
     }
 
     const accountId = setOnAny(validBidRequests, 'params.accountId');
-    const muid = getLocalStorageSafely('mgMuidn');
+    const muid = getLocalStorageSafely(LS_KEY_MUID);
     let url = (setOnAny(validBidRequests, 'params.bidUrl') || ENDPOINT_URL) + accountId;
     if (isStr(muid) && muid.length > 0) {
       url += (url.indexOf('?') > -1 ? '&' : '?') + 'muid=' + encodeURIComponent(muid);
@@ -272,6 +280,16 @@ export const spec = {
     logInfo(LOG_INFO_PREFIX + `onBidWon`);
   },
 
+  onAdRenderSucceeded: (bid) => {
+    mgidSession.trackRender(bid);
+    logInfo(LOG_INFO_PREFIX + `onAdRenderSucceeded`);
+  },
+
+  onBidViewable: (bid) => {
+    mgidSession.trackView(bid);
+    logInfo(LOG_INFO_PREFIX + `onBidViewable`);
+  },
+
   getUserSyncs: getUserSyncs,
 };
 
@@ -308,7 +326,10 @@ function populateNativeImp(imp, nativeReq) {
   nativeReq.plcmtcnt = nativeReq.plcmtcnt || 1;
   nativeReq.privacy = nativeReq.privacy || 1;
   if (!nativeReq.eventtrackers) {
-    nativeReq.eventtrackers = [{ event: 1, methods: [1, 2] }];
+    nativeReq.eventtrackers = [
+      { event: 1, methods: [1, 2] },
+      { event: 2, methods: [1] },
+    ];
   }
   let hasTitle = false;
   let hasImage = false;
@@ -370,13 +391,10 @@ function populateRequest(request, context) {
     try { topWindow = window.top; } catch (e) { topWindow = window; }
     deepSetValue(request, 'device.pxratio', getDevicePixelRatio(topWindow));
   }
-  if (!isInteger(deepAccess(request.device, 'devicetype'))) {
-    deepSetValue(request, 'device.devicetype', getDeviceType());
-  }
-  if (!isPlainObject(deepAccess(request.device, 'sua'))) {
-    const sua = getSUA();
-    if (sua) {
-      deepSetValue(request, 'device.sua', sua);
+  if (!isInteger(deepAccess(request.device, 'connectiontype'))) {
+    const connType = getConnectionType();
+    if (connType > 0) {
+      deepSetValue(request, 'device.connectiontype', connType);
     }
   }
   if (!isInteger(deepAccess(request.device, 'geo.utcoffset'))) {
@@ -388,6 +406,43 @@ function populateRequest(request, context) {
   if (!isStr(deepAccess(request, 'site.publisher.id'))) {
     deepSetValue(request, 'site.publisher.id', String(accountId));
   }
+
+  mgidSession.calculatePageSession();
+  const existingSua = deepAccess(request, 'device.sua');
+  const sua = mgidUad.buildSUA(existingSua);
+  if (sua !== existingSua && Object.keys(sua).length > 0) {
+    deepSetValue(request, 'device.sua', sua);
+  }
+
+  const uaInfo = parseUserAgentDetailed();
+  if (!isInteger(deepAccess(request, 'device.devicetype'))) {
+    deepSetValue(request, 'device.devicetype', uaInfo.devicetype);
+  }
+  if (!isStr(deepAccess(request, 'device.os'))) {
+    const suaBrand = deepAccess(request, 'device.sua.platform.brand');
+    if (isStr(suaBrand)) {
+      deepSetValue(request, 'device.os', suaBrand);
+    } else if (uaInfo.os !== 'unknown') {
+      deepSetValue(request, 'device.os', uaInfo.os);
+      if (!isStr(deepAccess(request, 'device.osv')) && uaInfo.osv !== 'other') {
+        deepSetValue(request, 'device.osv', uaInfo.osv);
+      }
+    }
+  }
+  if (!isStr(deepAccess(request, 'device.osv'))) {
+    const suaVersion = deepAccess(request, 'device.sua.platform.version');
+    if (isArray(suaVersion) && suaVersion.length > 0) {
+      deepSetValue(request, 'device.osv', suaVersion.join('.'));
+    }
+  }
+  if (!isStr(deepAccess(request, 'device.model'))) {
+    const model = deepAccess(request, 'device.sua.model');
+    if (isStr(model)) {
+      deepSetValue(request, 'device.model', model);
+    }
+  }
+
+  populateMgidData(request);
 
   // backward compat: params.bcat/badv/wlang used to be supported directly; ortb2 takes priority
   if (!isArray(request.bcat) || request.bcat.length === 0) {
@@ -410,30 +465,45 @@ function populateRequest(request, context) {
   }
 }
 
-function getDeviceType() {
-  const ua = navigator.userAgent;
-  if (/tablet|ipad|playbook|silk/i.test(ua) || (/Android/i.test(ua) && !/Mobile/i.test(ua))) {
-    return 5;
+function populateMgidData(request) {
+  const pvid = mgidSession.getOrCreatePvid();
+  if (isStr(pvid) && pvid.length > 0) {
+    deepSetValue(request, 'user.ext.mgid.pvid', pvid);
   }
-  if (/Mobile|iP(hone|od)|Android|BlackBerry|IEMobile|Kindle|Silk-Accelerated|(hpw|web)OS|Opera M(obi|ini)/.test(ua)) {
-    return 4;
-  }
-  return 2;
-}
 
-function getSUA() {
-  if (!navigator.userAgentData) {
-    return null;
+  const sessionInfo = mgidSession.getSessionInfo();
+  if (isStr(sessionInfo.sid) && sessionInfo.sid.length > 0) {
+    deepSetValue(request, 'user.ext.mgid.sid', sessionInfo.sid);
   }
-  const uad = navigator.userAgentData;
-  const sua = { mobile: uad.mobile ? 1 : 0 };
-  if (isArray(uad.brands) && uad.brands.length > 0) {
-    sua.browsers = uad.brands.map(b => ({ brand: b.brand, version: [b.version] }));
+  if (isNumber(sessionInfo.sessionPage) && sessionInfo.sessionPage > 0) {
+    deepSetValue(request, 'user.ext.mgid.session_page', sessionInfo.sessionPage);
   }
-  if (isStr(uad.platform)) {
-    sua.platform = { brand: uad.platform };
+  if (sessionInfo.sessionNum > 0) {
+    deepSetValue(request, 'user.ext.mgid.session_num', sessionInfo.sessionNum);
+    if (sessionInfo.sessionsWeek > 0) {
+      deepSetValue(request, 'user.ext.mgid.sessions_1w', sessionInfo.sessionsWeek);
+    }
+    if (isNumber(sessionInfo.timeBetweenSessions)) {
+      deepSetValue(request, 'user.ext.mgid.time_between_sessions', sessionInfo.timeBetweenSessions);
+    }
   }
-  return sua;
+
+  const widgets = mgidSession.getWidgetsData();
+  if (widgets) {
+    deepSetValue(request, 'user.ext.mgid.widgets', widgets);
+  }
+
+  try {
+    const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+    if (conn) {
+      if (isStr(conn.effectiveType)) {
+        deepSetValue(request, 'site.ext.mgid.niet', conn.effectiveType);
+      }
+      if (typeof conn.saveData === 'boolean') {
+        deepSetValue(request, 'site.ext.mgid.nisd', conn.saveData ? 1 : 0);
+      }
+    }
+  } catch (e) {}
 }
 
 function getLocalStorageSafely(key) {

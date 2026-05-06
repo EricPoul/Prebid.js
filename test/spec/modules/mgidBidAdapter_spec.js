@@ -1,8 +1,25 @@
 import { expect } from 'chai';
-import { spec, storage } from 'modules/mgidBidAdapter.js';
-import * as utils from '../../../src/utils.js';
-import { USERSYNC_DEFAULT_CONFIG } from '../../../src/userSync.js';
+import { mgidSession, mgidUad, spec, storage } from 'modules/mgidBidAdapter.js';
+import * as connectionUtils from '../../../libraries/connectionInfo/connectionUtils.js';
 import { config } from '../../../src/config.js';
+import { USERSYNC_DEFAULT_CONFIG } from '../../../src/userSync.js';
+import * as utils from '../../../src/utils.js';
+
+const ORIGINAL_USER_AGENT_DATA = window.navigator.userAgentData;
+const ORIGINAL_USER_AGENT = window.navigator.userAgent;
+const ORIGINAL_CONNECTION = Object.getOwnPropertyDescriptor(window.navigator, 'connection');
+const setUserAgentData = (value) => window.navigator.__defineGetter__('userAgentData', () => value);
+const setUserAgent = (ua) => window.navigator.__defineGetter__('userAgent', () => ua);
+const setConnection = (conn) => Object.defineProperty(window.navigator, 'connection', { configurable: true, value: conn });
+const restoreNavigator = () => {
+  setUserAgentData(ORIGINAL_USER_AGENT_DATA);
+  setUserAgent(ORIGINAL_USER_AGENT);
+  if (ORIGINAL_CONNECTION) {
+    Object.defineProperty(window.navigator, 'connection', ORIGINAL_CONNECTION);
+  } else {
+    delete window.navigator.connection;
+  }
+};
 
 describe('Mgid bid adapter', function () {
   let sandbox;
@@ -902,7 +919,7 @@ describe('Mgid bid adapter', function () {
       expect(data.site.content).deep.equal(bidderRequest.ortb2.site.content);
       expect(data.regs).deep.equal(bidderRequest.ortb2.regs);
       expect(data.user.data).deep.equal(bidderRequest.ortb2.user.data);
-      expect(data.user.ext).deep.equal(bidderRequest.ortb2.user.ext);
+      expect(data.user.ext.consent).to.equal(bidderRequest.ortb2.user.ext.consent);
     });
     it('should use params.bcat/badv/wlang when ortb2 does not provide them', function () {
       const bid = Object.assign({}, abid, {
@@ -932,31 +949,326 @@ describe('Mgid bid adapter', function () {
       expect(data.wlang).deep.equal(['de']);
     });
     it('should derive device fields from navigator', function () {
-      const bid = Object.assign({}, abid);
-      bid.mediaTypes = { banner: { sizes: [[300, 250]] } };
-
-      const originalUA = Object.getOwnPropertyDescriptor(Navigator.prototype, 'userAgent');
-      const originalUAD = navigator.userAgentData;
-      const setUA = (ua) => Object.defineProperty(navigator, 'userAgent', { configurable: true, get: () => ua });
+      const bid = Object.assign({}, abid, { mediaTypes: { banner: { sizes: [[300, 250]] } } });
+      sandbox.stub(storage, 'getDataFromLocalStorage').returns(null);
+      sandbox.stub(storage, 'getDataFromSessionStorage').returns(null);
+      mgidUad.reset();
+      mgidSession.reset();
       try {
-        setUA('Mozilla/5.0 (iPad; CPU OS 14_0 like Mac OS X) AppleWebKit/605');
+        setUserAgent('Mozilla/5.0 (iPad; CPU OS 14_0 like Mac OS X) AppleWebKit/605');
         expect(JSON.parse(spec.buildRequests([bid], {}).data).device.devicetype).to.equal(5);
 
-        setUA('Mozilla/5.0 (Linux; Android 12; SM-T870) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36');
+        setUserAgent('Mozilla/5.0 (Linux; Android 12; SM-T870 tablet) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36');
         expect(JSON.parse(spec.buildRequests([bid], {}).data).device.devicetype).to.equal(5);
 
-        setUA('Mozilla/5.0 (Linux; Android 10; Pixel 4) AppleWebKit/537.36 Mobile');
+        setUserAgent('Mozilla/5.0 (Linux; Android 10; Pixel 4) AppleWebKit/537.36 Mobile');
         expect(JSON.parse(spec.buildRequests([bid], {}).data).device.devicetype).to.equal(4);
 
-        Object.defineProperty(navigator, 'userAgentData', { configurable: true, value: undefined });
-        expect(JSON.parse(spec.buildRequests([bid], {}).data).device.sua).to.be.undefined;
+        setUserAgentData(undefined);
+        const sua = JSON.parse(spec.buildRequests([bid], {}).data).device.sua;
+        expect(sua).to.exist;
+        expect(sua.mobile).to.equal(1);
+        expect(sua.platform.brand).to.equal('Android');
       } finally {
-        if (originalUA) {
-          Object.defineProperty(Navigator.prototype, 'userAgent', originalUA);
-          delete navigator.userAgent;
-        }
-        Object.defineProperty(navigator, 'userAgentData', { configurable: true, value: originalUAD });
+        restoreNavigator();
       }
+    });
+
+    describe('populateSUA', function () {
+      const bid = Object.assign({}, abid, { mediaTypes: { banner: { sizes: [[300, 250]] } } });
+      let ls;
+
+      beforeEach(function () {
+        mgidUad.reset();
+        mgidSession.reset();
+        ls = {};
+        sandbox.stub(storage, 'getDataFromLocalStorage').callsFake((k) => (k in ls ? ls[k] : null));
+        sandbox.stub(storage, 'getDataFromSessionStorage').returns(null);
+      });
+
+      afterEach(restoreNavigator);
+
+      it('should set device.sua from navigator.userAgentData', function () {
+        setUserAgentData({ mobile: false, brands: [{ brand: 'Chrome', version: '136' }], platform: 'macOS' });
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.device.sua.mobile).to.equal(0);
+        expect(data.device.sua.browsers).to.deep.equal([{ brand: 'Chrome', version: ['136'] }]);
+        expect(data.device.sua.platform).to.deep.equal({ brand: 'macOS' });
+      });
+
+      it('should derive device.sua from UA string when userAgentData and storage are both absent', function () {
+        setUserAgentData(undefined);
+        setUserAgent('Mozilla/5.0 (Linux; Android 10; Pixel 4) AppleWebKit/537.36 Mobile');
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.device.sua).to.exist;
+        expect(data.device.sua.mobile).to.equal(1);
+        expect(data.device.sua.platform.brand).to.equal('Android');
+        expect(data.device.sua.browsers[0].brand).to.equal('Chrome');
+      });
+
+      it('should build device.sua from _mgUadCache localStorage when userAgentData is absent', function () {
+        setUserAgentData(undefined);
+        ls._mgPbUadCache = JSON.stringify({
+          mobile: false,
+          platform: 'macOS',
+          platformVersion: '15.0.0',
+          fullVersionList: [{ brand: 'Chrome', version: '136.0.0.0' }],
+          architecture: 'arm',
+          bitness: '64',
+        });
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        const sua = data.device.sua;
+        expect(sua).to.exist;
+        expect(sua.mobile).to.equal(0);
+        expect(sua.platform).to.deep.equal({ brand: 'macOS', version: ['15', '0', '0'] });
+        expect(sua.browsers).to.deep.equal([{ brand: 'Chrome', version: ['136', '0', '0', '0'] }]);
+        expect(sua.architecture).to.equal('arm');
+        expect(sua.bitness).to.equal('64');
+      });
+
+      it('should supplement navigator.userAgentData with high-entropy fields from _mgUadCache', function () {
+        setUserAgentData({ mobile: true, brands: [{ brand: 'Chrome', version: '136' }], platform: 'macOS' });
+        ls._mgPbUadCache = JSON.stringify({ platformVersion: '15.0.0', architecture: 'arm', bitness: '64' });
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        const sua = data.device.sua;
+        expect(sua.mobile).to.equal(1);
+        expect(sua.platform.brand).to.equal('macOS');
+        expect(sua.platform.version).to.deep.equal(['15', '0', '0']);
+        expect(sua.architecture).to.equal('arm');
+        expect(sua.bitness).to.equal('64');
+      });
+
+      it('should override FPD device.sua fields when MGID has corresponding values', function () {
+        setUserAgentData({ mobile: false, brands: [{ brand: 'Chrome', version: '136' }], platform: 'macOS' });
+        const bidderRequest = {
+          ortb2: { device: { sua: { mobile: 1, platform: { brand: 'Windows' }, browsers: [{ brand: 'Edge', version: ['100'] }] } } },
+        };
+
+        const data = JSON.parse(spec.buildRequests([bid], bidderRequest).data);
+        expect(data.device.sua.mobile).to.equal(0);
+        expect(data.device.sua.platform.brand).to.equal('macOS');
+        expect(data.device.sua.browsers[0].brand).to.equal('Chrome');
+      });
+
+      it('should prefer cache fullVersionList over sync brands for device.sua.browsers', function () {
+        setUserAgentData({ mobile: false, brands: [{ brand: 'Chrome', version: '136' }], platform: 'macOS' });
+        ls._mgPbUadCache = JSON.stringify({ fullVersionList: [{ brand: 'Chrome', version: '136.0.7103.114' }] });
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.device.sua.browsers).to.deep.equal([
+          { brand: 'Chrome', version: ['136', '0', '7103', '114'] },
+        ]);
+      });
+    });
+
+    describe('device.os / osv / model', function () {
+      const bid = Object.assign({}, abid, { mediaTypes: { banner: { sizes: [[300, 250]] } } });
+      let ls;
+
+      beforeEach(function () {
+        mgidUad.reset();
+        mgidSession.reset();
+        ls = {};
+        sandbox.stub(storage, 'getDataFromLocalStorage').callsFake((k) => (k in ls ? ls[k] : null));
+        sandbox.stub(storage, 'getDataFromSessionStorage').returns(null);
+      });
+
+      afterEach(restoreNavigator);
+
+      it('should set device.os from sua.platform.brand when SUA is available', function () {
+        setUserAgentData({ mobile: false, brands: [], platform: 'macOS' });
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.device.os).to.equal('macOS');
+      });
+
+      it('should set device.os from UA string when SUA platform is absent', function () {
+        setUserAgentData(undefined);
+        setUserAgent('Mozilla/5.0 (Linux; Android 10; Pixel 4) AppleWebKit/537.36 Mobile');
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.device.os).to.equal('Android');
+        expect(data.device.osv).to.be.a('string').and.not.equal('');
+      });
+
+      it('should set device.osv from sua.platform.version (from _mgUadCache)', function () {
+        setUserAgentData(undefined);
+        ls._mgPbUadCache = JSON.stringify({ platform: 'macOS', platformVersion: '15.0.0' });
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.device.osv).to.equal('15.0.0');
+      });
+
+      it('should set device.model from sua.model (from _mgUadCache)', function () {
+        setUserAgentData(undefined);
+        ls._mgPbUadCache = JSON.stringify({ model: 'Pixel 9' });
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.device.model).to.equal('Pixel 9');
+      });
+    });
+
+    describe('populateMgidData', function () {
+      const bid = Object.assign({}, abid, { mediaTypes: { banner: { sizes: [[300, 250]] } } });
+      let ls;
+
+      beforeEach(function () {
+        mgidUad.reset();
+        mgidSession.reset();
+        delete window._mgPvid;
+        delete window._mgPbSessionPages;
+        delete window._mgPvidList;
+        ls = {};
+        sandbox.stub(storage, 'getDataFromLocalStorage').callsFake((key) => (key in ls ? ls[key] : null));
+        sandbox.stub(storage, 'getDataFromSessionStorage').returns(null);
+        // writes are no-ops so getSessionInfo reads the seeded `ls`, not the value calculatePageSession just wrote
+        sandbox.stub(storage, 'setDataInLocalStorage');
+        sandbox.stub(storage, 'setDataInSessionStorage');
+      });
+
+      afterEach(restoreNavigator);
+
+      it('should forward sid and session_page from storage', function () {
+        ls._mgPbSessionId = 'sid-xyz';
+        ls._mgPbSessionPagesNumber = '3';
+        ls._mgPbSessionsTimeList = JSON.stringify([Date.now()]);
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.user.ext.mgid.sid).to.equal('sid-xyz');
+        expect(data.user.ext.mgid.session_page).to.equal(3);
+      });
+
+      it('should set session_num and sessions_1w from sessions list within 7 days', function () {
+        const now = Date.now();
+        ls._mgPbSessionsTimeList = JSON.stringify([now, now - 86400000]);
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.user.ext.mgid.session_num).to.equal(2);
+        expect(data.user.ext.mgid.sessions_1w).to.equal(2);
+      });
+
+      it('should omit sessions_1w when all sessions are older than 7 days', function () {
+        ls._mgPbSessionsTimeList = JSON.stringify([Date.now() - 8 * 24 * 60 * 60 * 1000]);
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.user.ext.mgid.session_num).to.equal(1);
+        expect(data.user.ext.mgid).to.not.have.property('sessions_1w');
+      });
+
+      it('should set time_between_sessions in minutes when at least 2 sessions exist', function () {
+        const now = Date.now();
+        ls._mgPbSessionsTimeList = JSON.stringify([now - 45 * 60 * 1000, now]);
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.user.ext.mgid.time_between_sessions).to.equal(45);
+      });
+
+      it('should omit time_between_sessions when only one session exists', function () {
+        ls._mgPbSessionsTimeList = JSON.stringify([Date.now()]);
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.user.ext.mgid).to.not.have.property('time_between_sessions');
+      });
+
+      it('should populate user.ext.mgid.widgets with session + viewrate fields', function () {
+        const now = Date.now();
+        ls._mgPbRenderedSessions = JSON.stringify({ '12345': { id: 'sid-1', page: 4, list: [now, now - 86400000] } });
+        ls._mgPbViewrate = JSON.stringify({ '12345': [{ id: 'vr-1', st: now, v: 3, r: 5 }] });
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.user.ext.mgid.widgets).to.deep.equal({
+          '12345': {
+            sid: 'sid-1',
+            session_page: 4,
+            session_num: 2,
+            sessions_1w: 2,
+            viewrate_1w: '3,5',
+          },
+        });
+      });
+
+      it('should drop viewrate entries older than 7 days from viewrate_1w', function () {
+        const now = Date.now();
+        ls._mgPbViewrate = JSON.stringify({
+          '12345': [
+            { id: 'vr-old', st: now - 8 * 24 * 60 * 60 * 1000, v: 100, r: 100 },
+            { id: 'vr-recent', st: now, v: 2, r: 3 },
+          ],
+        });
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.user.ext.mgid.widgets['12345'].viewrate_1w).to.equal('2,3');
+      });
+
+      it('should omit viewrate_1w when v or r is 0', function () {
+        ls._mgPbViewrate = JSON.stringify({ '12345': [{ id: 'vr-1', st: Date.now(), v: 0, r: 5 }] });
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.user.ext.mgid).to.not.have.property('widgets');
+      });
+
+      it('should set only pvid on user.ext.mgid when no session or widget storage exists', function () {
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.user.ext.mgid).to.have.all.keys('pvid');
+      });
+
+      it('should set device.connectiontype from getConnectionType', function () {
+        sandbox.stub(connectionUtils, 'getConnectionType').returns(6);
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.device.connectiontype).to.equal(6);
+      });
+
+      it('should not set device.connectiontype when getConnectionType returns 0', function () {
+        sandbox.stub(connectionUtils, 'getConnectionType').returns(0);
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.device.connectiontype).to.be.undefined;
+      });
+
+      it('should set site.ext.mgid.niet and nisd from navigator.connection', function () {
+        sandbox.stub(connectionUtils, 'getConnectionType').returns(0);
+        setConnection({ effectiveType: '4g', saveData: false });
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.site.ext.mgid.niet).to.equal('4g');
+        expect(data.site.ext.mgid.nisd).to.equal(0);
+      });
+
+      it('should set nisd to 1 when saveData is true', function () {
+        sandbox.stub(connectionUtils, 'getConnectionType').returns(0);
+        setConnection({ effectiveType: '2g', saveData: true });
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.site.ext.mgid.niet).to.equal('2g');
+        expect(data.site.ext.mgid.nisd).to.equal(1);
+      });
+
+      it('should report the widget render data in the request after an ad is rendered', function () {
+        storage.setDataInLocalStorage.callsFake((k, v) => { ls[k] = v; });
+        ls._mgPbSessionId = 'sid-track';
+
+        spec.onAdRenderSucceeded({ creativeId: '777_creative' });
+
+        const widget = JSON.parse(spec.buildRequests([bid], {}).data).user.ext.mgid.widgets['777'];
+        expect(widget.session_page).to.equal(1);
+        expect(widget).to.not.have.property('viewrate_1w'); // no view yet → r>0 but v=0
+      });
+
+      it('should report the widget viewrate in the request after an ad is rendered and viewed', function () {
+        storage.setDataInLocalStorage.callsFake((k, v) => { ls[k] = v; });
+        ls._mgPbSessionId = 'sid-track';
+
+        spec.onAdRenderSucceeded({ creativeId: '777_creative' });
+        spec.onBidViewable({ creativeId: '777_creative' });
+
+        const data = JSON.parse(spec.buildRequests([bid], {}).data);
+        expect(data.user.ext.mgid.widgets['777'].viewrate_1w).to.equal('1,1');
+      });
     });
   });
 
